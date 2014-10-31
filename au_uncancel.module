@@ -1,0 +1,425 @@
+<?php
+//Uncancel Process
+
+/*
+ Original Role Possibilities:
+ *User: Accepted
+ *User: Accepted and Letter Sent
+ User: Confirmed Not Submitted
+ User: Confirmed Submitted
+ User: Courses Not Submitted
+ User: Courses Submitted
+ User: Itinerary Not Submitted
+ User: Itinerary Submitted
+ User: Payment Mailed
+ User: Payment Not Submitted 
+*/
+
+/**
+ * Implementation of hook_mail().
+ */
+function au_uncancel_mail($key, &$message, $params){
+  // Set the mail content type to html to send an html e-mail (optional).
+  $message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed';
+
+  // Grab the subject and body from params and add it to the message.
+  $message['subject'] = $params['subject'];
+  $message['body'] = $params['body'];
+}
+
+function au_uncancel_set_message($message = NULL, $type = 'status', $repeat = TRUE, $final = FALSE) {
+  if ($message) {
+    if (!isset($_SESSION['messages'])) {
+      $_SESSION['au_messages'] = array();
+    }
+
+    if (!isset($_SESSION['messages'][$type])) {
+      $_SESSION['au_messages'][$type] = array();
+    }
+
+    if ($repeat || !in_array($message, $_SESSION['messages'][$type])) {
+      drupal_set_message($message);
+      $_SESSION['au_messages'][$type][] = $message;
+    }
+
+    if($final){
+    	$message_string = "<p>A user at Acton University was just un-canceled.  Here's what happened in case anything blew up.</p>";
+    	foreach($_SESSION['au_messages'][$type] as $msg){
+    		$message_string .= $msg . "<br />";
+    	}
+		$email_params = array(
+		  'subject' => 'AU Un-Cancel Notice',
+		  'body' => $message_string,
+		);
+		drupal_mail('au_uncancel', 'au_uncancel_key', "webmaster@acton.org", language_default(), $email_params);
+		drupal_mail('au_uncancel', 'au_uncancel_key', "programs@acton.org", language_default(), $email_params);
+    }
+  }
+  // messages not set when DB connection fails
+  return isset($_SESSION['messages']) ? $_SESSION['messages'] : NULL;
+}
+
+function au_uncancel_menu() {
+	$items['adminuncancel/%'] = array(
+	  'title' => 'Uncancel Participant',
+	  'page callback' => 'au_uncancel_do_uncancel',
+	  'page arguments' => array(1),
+      'access arguments' => array('edit field_acceptordecline'),
+      'type' => MENU_CALLBACK
+	);
+	return $items;
+}
+
+function au_uncancel_do_uncancel($uid) {
+	$course_selection_content_type = 'courseselection15';
+	$start_date_range = 1404187200;
+	$end_date_range = 1438228800;
+
+	$user = user_load(array('uid' => $uid));
+	$cancel_type = get_type_of_cancel($user->roles);
+	$package = get_original_package($user->uid, $start_date_range, $end_date_range);
+	$mail_params = array(
+  		'subject' => $my_node->title,
+  		'body' => "<p>Hello World</p>",
+	);
+	if($cancel_type != 'not canceled' && $package != 'none'){
+		switch($cancel_type){
+			case 'canceled':
+				restore_old_status_canceled($user, $package, $start_date_range, $end_date_range, $course_selection_content_type);
+				break;
+			case 'declined':
+				restore_old_status_declined($user, $package, $start_date_range, $end_date_range, $course_selection_content_type);
+				break;
+			case 'denied':
+				restore_old_status_denied($user, $package);
+				break;
+		}
+		au_uncancel_set_message("COMPLETED rollback back from ".$cancel_type." status.", "status", TRUE, TRUE);
+	}
+	drupal_goto('user/'. $uid . '/participantview', 'uid=' . $uid);
+}
+
+function get_type_of_cancel($roles){
+	foreach($roles as $role=>$name){
+		if($role == 17){
+			return 'canceled';
+		}
+		if($role == 16){
+			return 'declined';
+		}
+		if($role == 36){
+			return 'denied';
+		}
+	}
+	return 'not canceled';
+}
+
+function get_original_package($uid, $start_date_range, $end_date_range){
+	$result = db_query("SELECT node.nid AS nid
+ 		FROM node node 
+ 		LEFT JOIN content_field_person node_data_field_person ON node.vid = node_data_field_person.vid
+ 		INNER JOIN users users_node_data_field_person ON node_data_field_person.field_person_uid = users_node_data_field_person.uid
+ 		WHERE (node.type in ('package')) AND (node.created >= %d) AND (node.created <= %d) AND (node.status = 1) AND (users_node_data_field_person.uid = %d )", array($start_date_range, $end_date_range, $uid));
+	$row = db_fetch_array($result);
+	if(is_numeric($row['nid'])){
+		$node = node_load($row['nid']);
+		return $node;
+	}else{
+		return 'none';
+	}
+}
+
+/*
+ Move a user from the canceled status back to the status they had before canceling.
+*/
+function restore_old_status_canceled($user, $package, $start_date_range, $end_date_range, $course_selection_content_type){
+	au_uncancel_set_message("Examining username " . $user->name . " with UID " . $user->uid . "...");
+	au_uncancel_set_message("User was canceled. Performing un-Cancel tasks.");
+	//A normal cancel can't assume anything in particular other than:
+	//User has a package made by admin that MAY or MAY NOT have been required to confirm.
+	//User MAY have selected courses, previously confirmed, paid, and selected itinerary.
+	//User has a cancellation node that they created that needs to be removed.
+	unset($user->roles[17]); 
+	au_uncancel_set_message("Removed role 'User: Canceled'.");
+	$user->roles[11] = 'User: Accepted';
+	au_uncancel_set_message("Added role 'User: Accepted'.");
+	$user->roles[26] = 'User: Accepted and Letter Sent';
+	au_uncancel_set_message("Added role 'User: Accepted and Letter Sent'.");
+
+	//Cancellation
+	$canceled_nid = previous_canceled_submission($user->uid, $start_date_range, $end_date_range);
+	if($canceled_nid != 0){
+		node_delete($canceled_nid);
+		au_uncancel_set_message("Deleting the previous cancellation submission.");
+	}
+	
+	//Confirmation
+	if(previous_confirmation($user->uid, $start_date_range, $end_date_range) != 0){
+		$user->roles[13] = 'User: Confirmed Submitted'; 
+		au_uncancel_set_message("Previous confirmation content found. Added role 'User: Confirmed Submitted'.");
+	}else{
+		$bypass_confirmation = false;
+		foreach($user->roles as $role=>$name){
+			if($role == 41){
+				$user->roles[13] = 'User: Confirmed Submitted';
+				au_uncancel_set_message("Existing bypass confirmation role found. Added role 'User: Confirmed Submitted'.");
+				$bypass_confirmation = true;
+			}
+		}
+		if(!$bypass_confirmation){
+			$user->roles[29] = 'User: Confirmed Not Submitted';
+			au_uncancel_set_message("No previous confirmation content or bypass role found. Added role 'User: Confirmed Not Submitted'.");
+		}
+	}
+
+	//Courses
+	if(previous_course_submission($user->uid, $course_selection_content_type) != 0){
+		$user->roles[55] = 'User: Courses Submitted';
+		au_uncancel_set_message("Previous course submission found. Added role 'User: Courses Submitted'.");
+	}else{
+		$user->roles[54] = 'User: Courses Not Submitted';
+		au_uncancel_set_message("No course submissions found. Added role 'User: Courses Not Submitted'.");
+	}
+
+	//Itinerary
+	if(previous_itinerary_submission($user->uid, $start_date_range, $end_date_range) != 0){
+		$user->roles[15] = 'User: Itinerary Submitted';
+		au_uncancel_set_message("Previous itinerary found. Added role 'User: Itinerary Submitted'.");
+	}else{
+		$bypass = true;
+		foreach($user->roles as $role=>$name){
+			if($role == 32 || $role == 33 || $role == 34 || $role == 35){
+				$user->roles[27] = 'User: Itinerary Not Submitted';
+				au_uncancel_set_message("No previous itinerary found but the user has an itinerary role requirement. Added role 'User: Itinerary Not Submitted'.");
+				$bypass = false;
+			}
+		}
+		if($bypass){
+			$user->roles[15] = 'User: Itinerary Submitted';
+			au_uncancel_set_message("No itinerary was required of this user. Added role 'User: Itinerary Submitted'.");
+		}
+	}
+
+	//Payment
+	$payment = previous_payment_submission($user, $start_date_range, $end_date_range);
+	if($payment != 'mailed' && $payment != 'paidstatus' && $payment !='bypass'){
+		au_uncancel_set_message("User did not previously pay by mail, doesn't have a current paid status, and has not bypassed payment.  We need to assign a payment status.");
+		if($payment == 'zero'){
+			$user->roles[28] = 'User: Payment Not Submitted';
+			au_uncancel_set_message("User had no previous payment. Added role 'User: Payment Not Submitted'.");
+		}else{
+			$user->roles[14] = 'User: Payment Submitted';
+			au_uncancel_set_message("User had a previous payment. Added role 'User: Payment Submitted'.");
+		}
+	}
+
+	$edit = array('roles' => $user->roles);
+	user_save($user, $edit);
+}
+
+/*
+ Move a user from the declined status back to the status they had before declining.
+*/
+function restore_old_status_declined($user, $package, $start_date_range, $end_date_range, $course_selection_content_type){
+	au_uncancel_set_message("Examining username " . $user->name . " with UID " . $user->uid . "...");
+	au_uncancel_set_message("User had declined. Performing un-Decline tasks.");
+	//A declined cancel can't assume anything in particular other than:
+	//User has a package made by admin and they were required to confirm (confirmation is where they decline).
+	//User MAY have selected courses, paid, and selected itinerary.
+	//User has a confirmation node that needs to be removed.
+	unset($user->roles[16]);
+	au_uncancel_set_message("Removed role 'User: Declined'.");
+	$user->roles[11] = 'User: Accepted';
+	au_uncancel_set_message("Added role 'User: Accepted'.");
+	$user->roles[26] = 'User: Accepted and Letter Sent';
+	au_uncancel_set_message("Added role 'User: Accepted and Letter Sent'.");
+	$user->roles[29] = 'User: Confirmed Not Submitted';
+	au_uncancel_set_message("Since user declined, they need to re-confirm. Added role 'User: Confirmed Not Submitted'.");
+	
+	//Confirmation
+	$confirmation_nid = previous_confirmation($user->uid, $start_date_range, $end_date_range);
+	if($confirmation_nid != 0){
+		node_delete($confirmation_nid);
+		au_uncancel_set_message("Deleting the previous confirmation content since they declined.");
+	}
+
+	//Courses
+	if(previous_course_submission($user->uid, $course_selection_content_type) != 0){
+		$user->roles[55] = 'User: Courses Submitted';
+		au_uncancel_set_message("Previous course submission found. Added role 'User: Courses Submitted'.");
+	}else{
+		$user->roles[54] = 'User: Courses Not Submitted';
+		au_uncancel_set_message("No course submissions found. Added role 'User: Courses Not Submitted'.");
+	}
+
+	//Itinerary
+	if(previous_itinerary_submission($user->uid, $start_date_range, $end_date_range) != 0){
+		$user->roles[15] = 'User: Itinerary Submitted';
+		au_uncancel_set_message("Previous itinerary found. Added role 'User: Itinerary Submitted'.");
+	}else{
+		$bypass = true;
+		foreach($user->roles as $role=>$name){
+			if($role == 32 || $role == 33 || $role == 34 || $role == 35){
+				$user->roles[27] = 'User: Itinerary Not Submitted';
+				au_uncancel_set_message("No previous itinerary found but the user has an itinerary role requirement. Added role 'User: Itinerary Not Submitted'.");
+				$bypass = false;
+			}
+		}
+		if($bypass){
+			$user->roles[15] = 'User: Itinerary Submitted';
+			au_uncancel_set_message("No itinerary was required of this user. Added role 'User: Itinerary Submitted'.");
+		}
+	}
+
+	//Payment
+	$payment = previous_payment_submission($user, $start_date_range, $end_date_range);
+	if($payment != 'mailed' && $payment != 'paidstatus' && $payment !='bypass'){
+		au_uncancel_set_message("User did not previously pay by mail, doesn't have a current paid status, and has not bypassed payment.  We need to assign a payment status.");
+		if($payment == 'zero'){
+			$user->roles[28] = 'User: Payment Not Submitted';
+			au_uncancel_set_message("User had no previous payment. Added role 'User: Payment Not Submitted'.");
+		}else{
+			$user->roles[14] = 'User: Payment Submitted';
+			au_uncancel_set_message("User had a previous payment. Added role 'User: Payment Submitted'.");
+		}
+	}
+
+	$edit = array('roles' => $user->roles);
+	user_save($user, $edit);
+}
+
+/*
+ Move a user from the denied status back to the status they had before being denied.
+*/
+function restore_old_status_denied($user, $package){
+	au_uncancel_set_message("Examining username " . $user->name . " with UID " . $user->uid . "...");
+	au_uncancel_set_message("User was denied before they did anything. Performing un-Deny tasks.");
+	//A denied cancel can only assume:
+	//User has a package made by admin that needs to be removed with the denied field set.
+	node_delete($package->nid);
+	au_uncancel_set_message("Deleting the previous denied package.");
+	unset($user->roles[36]);
+	au_uncancel_set_message("Removed role 'User: Denied'.");
+	$user->roles[10] = 'User: Pending';
+	au_uncancel_set_message("Added role 'User: Pending'.");
+
+	$edit = array('roles' => $user->roles);
+	user_save($user, $edit);
+}
+
+/*
+ Return node id of a previous confirmation content item if it exists.
+*/
+function previous_confirmation($uid, $start_date_range, $end_date_range){
+	$result = db_query("SELECT node.nid AS nid,
+   		node.title AS node_title
+ 		FROM node node 
+ 		INNER JOIN users users ON node.uid = users.uid
+ 		WHERE (node.status = 1) AND (node.type in ('confirmparticipation')) AND (node.created >= %d) AND (node.created <= %d) AND (users.uid = %d )", array($start_date_range, $end_date_range, $uid));
+	$row = db_fetch_array($result);
+	if(is_numeric($row['nid'])){
+		return $row['nid'];
+	}else{
+		return 0;
+	}
+}
+
+/*
+ Return the node id of a previous course submission if it exists.
+*/
+function previous_course_submission($uid, $course_selection_content_type){
+	$result = db_query("SELECT node.nid AS nid,
+   		node.title AS node_title
+ 		FROM node node 
+ 		INNER JOIN users users ON node.uid = users.uid
+ 		WHERE (node.status = 1) AND (node.type in ('%s')) AND (users.uid = %d )", array($course_selection_content_type, $uid));
+	$row = db_fetch_array($result);
+	if(is_numeric($row['nid'])){
+		return $row['nid'];
+	}else{
+		return 0;
+	}
+}
+
+/*
+ Return the node id of a previous itinerary submission if it exists.
+*/
+function previous_itinerary_submission($uid, $start_date_range, $end_date_range){
+	$result = db_query("SELECT node.nid AS nid,
+   		node.title AS node_title
+ 		FROM node node 
+ 		INNER JOIN users users ON node.uid = users.uid
+ 		WHERE (node.status = 1) AND (node.type in ('itinerary')) AND (node.created >= %d) AND (node.created <= %d) AND (users.uid = %d )", array($start_date_range, $end_date_range, $uid));
+	$row = db_fetch_array($result);
+	if(is_numeric($row['nid'])){
+		return $row['nid'];
+	}else{
+		return 0;
+	}
+}
+
+/*
+ Return the status of previous payment.  The site keeps a user's role if they mailed
+ or previously paid, so we check for those things first.  If they're not present,
+ we'll query for a previous order for this year.  Finally, if that doesn't exist,
+ we'll return zero.
+*/
+function previous_payment_submission($user, $start_date_range, $end_date_range){
+	$mailed = false;
+	$paidstatus = false;
+	foreach($user->roles as $role=>$name){
+		if($role == 37){
+			$mailed = true;
+		}
+		if($role == 14){
+			$paidstatus = true;
+		}
+		if($role == 40){
+			$bypass = true;
+		}
+	}
+	if(!$mailed && !$paidstatus && !$bypass){
+		$result = db_query("SELECT uc_orders.order_id AS order_id,
+   			uc_orders.created AS uc_orders_created
+ 			FROM uc_orders uc_orders 
+ 			LEFT JOIN users users_uc_orders ON uc_orders.uid = users_uc_orders.uid
+ 			LEFT JOIN users users ON uc_orders.uid = users.uid
+ 			WHERE (uc_orders.created >= %d) AND (uc_orders.created <= %d) AND (uc_orders.order_status in ('bitpay_paid', 'completed')) AND (users.uid = %d )", array($start_date_range, $end_date_range, $user->uid));
+		$row = db_fetch_array($result);
+
+		if(is_numeric($row['order_id'])){
+			return $row['order_id'];
+		}else{
+			return 'zero';
+		}
+	}
+	if($paidstatus){
+		au_uncancel_set_message("User had the role 'User: Payment Submitted', so we'll leave that alone.");
+		return 'paidstatus';
+	}
+	if($mailed){
+		au_uncancel_set_message("User had the role 'User: Payment Mailed', so we'll leave that alone.");
+		return 'mailed';
+	}
+	if($bypass){
+		au_uncancel_set_message("User had the role 'Accepted: Bypass Payment', so we'll leave that alone.");
+		return 'bypass';
+	}
+}
+
+/*
+ Return the node id of a previous cancellation if it exists.
+*/
+function previous_canceled_submission($uid, $start_date_range, $end_date_range){
+	$result = db_query("SELECT node.nid AS nid,
+   		node.title AS node_title
+ 		FROM node node 
+ 		INNER JOIN users users ON node.uid = users.uid
+ 		WHERE (node.status = 1) AND (node.type in ('cancelparticipation')) AND (node.created >= %d) AND (node.created <= %d) AND (users.uid = %d )", array($start_date_range, $end_date_range, $uid));
+	$row = db_fetch_array($result);
+	if(is_numeric($row['nid'])){
+		return $row['nid'];
+	}else{
+		return 0;
+	}
+}

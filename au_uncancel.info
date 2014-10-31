@@ -1,0 +1,5 @@
+name = Acton University Uncancel
+description = Brings an AU participant back to the state they were in before cancellation.
+version = "6.x-1.0"
+core = 6.x
+project = "au_uncancel"
